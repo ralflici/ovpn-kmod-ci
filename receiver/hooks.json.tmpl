@@ -1,0 +1,45 @@
+[
+  {
+    "id": "github",
+    "execute-command": "receiver/github-webhook.sh",
+    "include-command-output-in-response": true,
+    "include-command-output-in-response-on-error": true,
+    "success-http-response-code": 202,
+    "trigger-rule-mismatch-http-response-code": 401,
+    "trigger-signature-soft-failures": true,
+    "pass-file-to-command": [
+      {
+        "source": "entire-payload",
+        "envname": "GITHUB_PAYLOAD"
+      }
+    ],
+    "pass-environment-to-command": [
+      {
+        "source": "header",
+        "name": "X-GitHub-Delivery",
+        "envname": "GITHUB_DELIVERY"
+      },
+      {
+        "source": "header",
+        "name": "X-GitHub-Event",
+        "envname": "GITHUB_EVENT"
+      }
+    ],
+    {{/* Signature failures only become normal rule mismatches inside an "or"
+         when trigger-signature-soft-failures is enabled. */}}
+    "trigger-rule": {
+      "or": [
+        {
+          "match": {
+            "type": "payload-hmac-sha256",
+            "secret": "{{ getenv "WEBHOOK_SECRET" | js }}",
+            "parameter": {
+              "source": "header",
+              "name": "X-Hub-Signature-256"
+            }
+          }
+        }
+      ]
+    }
+  }
+]

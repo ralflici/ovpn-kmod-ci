@@ -1,0 +1,148 @@
+---
+name: in-tree patch checks
+run-name: patch checks - ${{ github.event.client_payload.commit.short_sha || github.event.client_payload.commit.sha }} ${{ github.event.client_payload.commit.message }}  # yamllint disable-line rule:line-length
+
+"on":
+  repository_dispatch:
+    types: [ovpn-patch-check]
+
+permissions:
+  contents: read
+
+jobs:
+  patch-checks:
+    name: patch checks - ${{ github.event.client_payload.commit.short_sha || github.event.client_payload.commit.sha }}  # yamllint disable-line rule:line-length
+    # Pin the runner image so webhook-triggered checks do not move when
+    # GitHub changes the ubuntu-latest alias.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    env:
+      # Flatten the repository_dispatch payload into shell variables used by
+      # the status helper and checkout steps below.
+      CONTEXT: ovpn-ci/patch-checks
+      RUN_URL: >-
+        ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{
+        github.run_id }}
+      SOURCE_REPO: ${{ github.event.client_payload.source.repo }}
+      SOURCE_REF: ${{ github.event.client_payload.source.git_ref }}
+      SOURCE_CLONE_URL: ${{ github.event.client_payload.source.clone_url }}
+      SOURCE_SHA: ${{ github.event.client_payload.commit.sha }}
+
+    steps:
+      - name: Checkout CI repository
+        uses: actions/checkout@v5
+
+      - name: Mark source commit pending
+        continue-on-error: true
+        env:
+          GITHUB_STATUS_TOKEN: ${{ secrets.OVPN_NET_NEXT_STATUS_TOKEN }}
+        run: |
+          ./scripts/post-github-status.sh \
+            --repo "${SOURCE_REPO}" \
+            --sha "${SOURCE_SHA}" \
+            --state pending \
+            --context "${CONTEXT}" \
+            --description "ovpn patch checks are running" \
+            --target-url "${RUN_URL}"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            codespell \
+            git \
+            jq \
+            make \
+            patch \
+            perl \
+            python3-pip \
+            shellcheck \
+            yamllint
+          # Install Python linters from pip so NIPA sees consistent tool names
+          # and versions even when Ubuntu's apt packages lag or differ.
+          python3 -m pip install --user --break-system-packages \
+            pylint \
+            ruff
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Checkout source repository
+        run: |
+          # Fetch the tested commit and its parent. The next step fetches only
+          # the extra commit objects needed for Fixes tag validation.
+          git init source
+          git -C source remote add origin "${SOURCE_CLONE_URL}"
+          git -C source fetch \
+            --depth 2 \
+            --filter=blob:none \
+            origin \
+            "${SOURCE_SHA}"
+          git -C source checkout --detach FETCH_HEAD
+          git -C source rev-parse --verify HEAD~
+
+      - name: Fetch Fixes targets
+        # checkpatch/verify_fixes need referenced Fixes commits to be present,
+        # but fetching the whole Linux commit graph is expensive on cold
+        # runners.
+        run: |
+          mapfile -t fixes_targets < <(
+            jq -r '.client_payload.commit.fixes_targets[]?' \
+              "${GITHUB_EVENT_PATH}"
+          )
+
+          if [ "${#fixes_targets[@]}" -eq 0 ]; then
+            echo "No Fixes targets to fetch"
+            exit 0
+          fi
+
+          for sha in "${fixes_targets[@]}"; do
+            echo "Fetching Fixes target: ${sha}"
+            git -C source fetch \
+              --filter=blob:none \
+              --depth=1 \
+              origin \
+              "${sha}"
+          done
+
+      - name: Checkout NIPA
+        run: |
+          git clone --depth 1 https://github.com/linux-netdev/nipa.git nipa
+
+      - name: Run NIPA patch checks
+        run: |
+          ./scripts/run-nipa.py \
+            --repo source \
+            --nipa nipa \
+            --results "${RUNNER_TEMP}/nipa-results"
+
+      - name: Mark source commit result
+        # Run even after a checkout/test failure so the source commit does not
+        # remain stuck with a pending external status.
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_STATUS_TOKEN: ${{ secrets.OVPN_NET_NEXT_STATUS_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case "${JOB_STATUS}" in
+            success)
+              state=success
+              description="ovpn patch checks passed"
+              ;;
+            cancelled)
+              state=error
+              description="ovpn patch checks were cancelled"
+              ;;
+            *)
+              state=failure
+              description="ovpn patch checks failed"
+              ;;
+          esac
+
+          ./scripts/post-github-status.sh \
+            --repo "${SOURCE_REPO}" \
+            --sha "${SOURCE_SHA}" \
+            --state "${state}" \
+            --context "${CONTEXT}" \
+            --description "${description}" \
+            --target-url "${RUN_URL}"
