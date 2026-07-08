@@ -9,7 +9,14 @@ rootfs_find_kernel_image() {
 	local kernel=""
 
 	if [ -d "${rootfs}/boot" ]; then
-		kernel=$(find "${rootfs}/boot" -maxdepth 1 -type f -name 'vmlinuz-*' |
+		kernel=$(find "${rootfs}/boot" -maxdepth 1 \
+			\( -type f -o -xtype f \) -name 'vmlinuz-*' |
+			sort -V | tail -n1)
+	fi
+
+	if [ -z "${kernel}" ] && [ -d "${rootfs}/boot" ]; then
+		kernel=$(find "${rootfs}/boot" -maxdepth 1 \
+			\( -type f -o -xtype f \) -name 'Image-*' |
 			sort -V | tail -n1)
 	fi
 
@@ -21,6 +28,11 @@ rootfs_find_kernel_image() {
 	if [ -d "${rootfs}/lib/modules" ]; then
 		kernel=$(find "${rootfs}/lib/modules" -mindepth 2 -maxdepth 2 \
 			-type f -name vmlinuz | sort -V | tail -n1)
+	fi
+
+	if [ -z "${kernel}" ] && [ -d "${rootfs}/lib/modules" ]; then
+		kernel=$(find "${rootfs}/lib/modules" -mindepth 2 -maxdepth 2 \
+			-type f -name Image | sort -V | tail -n1)
 	fi
 
 	printf '%s\n' "${kernel}"
@@ -38,10 +50,18 @@ rootfs_kernel_release() {
 	*/vmlinuz-*)
 		printf '%s\n' "${kernel##*/vmlinuz-}"
 		;;
+	# /boot/Image-<release>, used by openSUSE aarch64 kernel packages
+	*/Image-*)
+		printf '%s\n' "${kernel##*/Image-}"
+		;;
 	# /lib/modules/<release>/vmlinuz, used only if the /boot lookup above
 	# did not find a versioned image
 	*/vmlinuz)
 		release=${kernel%/vmlinuz}
+		printf '%s\n' "${release##*/}"
+		;;
+	*/Image)
+		release=${kernel%/Image}
 		printf '%s\n' "${release##*/}"
 		;;
 	*)

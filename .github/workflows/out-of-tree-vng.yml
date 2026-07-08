@@ -23,7 +23,7 @@ name: out-of-tree virtme-ng matrix
         description: Ref to check out from vng-repository.
         required: false
         type: string
-        default: kmod-ci-virtiofs-fixes
+        default: arm64-zboot-normalize-ci
       cache-prefix:
         description: Prefix for successful scheduled-run cache entries.
         required: true
@@ -39,10 +39,20 @@ name: out-of-tree virtme-ng matrix
           "rhel-8","rhel-9","rhel-10",
           "opensuse-leap-15.6","opensuse-leap-16.0",
           "opensuse-tumbleweed"]
+      arch:
+        description: Host and guest architecture to test.
+        required: false
+        type: string
+        default: x86_64
       guest-script:
         description: Executable script in the caller repo to run inside the VM.
         required: true
         type: string
+      rootfs-profile:
+        description: Rootfs package profile to build.
+        required: false
+        type: string
+        default: selftests
       prepare-command:
         description: Optional caller-repo command to run before booting the VM.
         required: false
@@ -64,8 +74,11 @@ permissions:
 
 jobs:
   vng:
-    name: ${{ matrix.distro }} rootfs
-    runs-on: ubuntu-24.04
+    name: ${{ matrix.distro }} ${{ inputs.arch }} rootfs
+    runs-on: >-
+      ${{
+      inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04'
+      }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     strategy:
@@ -74,6 +87,28 @@ jobs:
         distro: ${{ fromJSON(inputs.distros) }}
 
     steps:
+      - name: Validate architecture
+        run: |
+          case "${{ inputs.arch }}" in
+          x86_64|arm64)
+            ;;
+          *)
+            echo "Unsupported architecture: ${{ inputs.arch }}" >&2
+            exit 1
+            ;;
+          esac
+
+      - name: Validate rootfs profile
+        run: |
+          case "${{ inputs.rootfs-profile }}" in
+          selftests|build)
+            ;;
+          *)
+            echo "Unsupported rootfs profile: ${{ inputs.rootfs-profile }}" >&2
+            exit 1
+            ;;
+          esac
+
       - name: Checkout caller repository
         uses: actions/checkout@v5
         with:
@@ -88,8 +123,18 @@ jobs:
 
       - name: Install host dependencies
         run: |
+          case "${{ inputs.arch }}" in
+          x86_64)
+            qemu_system=qemu-system-x86
+            ;;
+          arm64)
+            qemu_system=qemu-system-arm
+            ;;
+          esac
+
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            binutils-aarch64-linux-gnu \
             busybox-static \
             ca-certificates \
             cpio \
@@ -98,13 +143,14 @@ jobs:
             git \
             make \
             mmdebstrap \
-            qemu-system-x86 \
+            "${qemu_system}" \
             qemu-utils \
             rpm \
             rsync \
             ubuntu-keyring \
             virtiofsd \
-            virtme-ng
+            virtme-ng \
+            zstd
 
       - name: Checkout virtme-ng
         run: |
@@ -117,25 +163,34 @@ jobs:
 
       - name: Build ${{ matrix.distro }} rootfs
         env:
+          KMOD_CI_ARCH: ${{ inputs.arch }}
+          KMOD_CI_ROOTFS_PROFILE: ${{ inputs.rootfs-profile }}
+          ROOTFS_PARENT: ${{ runner.temp }}/rootfs/${{ inputs.arch }}
           # RHEL differs from the public targets: rootfs-build.sh uses these
           # secrets inside a temporary UBI container to authenticate against
           # Red Hat CDN and generate the rootfs.
           RHEL_ORG_ID: ${{ secrets.RHEL_ORG_ID }}
           RHEL_ACTIVATION_KEY: ${{ secrets.RHEL_ACTIVATION_KEY }}
         run: |
-          sudo --preserve-env=RHEL_ORG_ID,RHEL_ACTIVATION_KEY \
+          preserve_env=KMOD_CI_ARCH,KMOD_CI_ROOTFS_PROFILE
+          preserve_env=${preserve_env},RHEL_ORG_ID,RHEL_ACTIVATION_KEY
+          sudo --preserve-env="${preserve_env}" \
             ./kmod-ci/scripts/rootfs-build.sh \
             "${{ matrix.distro }}" \
-            "${RUNNER_TEMP}/rootfs/${{ matrix.distro }}"
+            "${ROOTFS_PARENT}/${{ matrix.distro }}"
 
       - name: Compute rootfs fingerprint
         id: rootfs-fingerprint
+        env:
+          KMOD_CI_ARCH: ${{ inputs.arch }}
+          KMOD_CI_ROOTFS_PROFILE: ${{ inputs.rootfs-profile }}
+          ROOTFS_PARENT: ${{ runner.temp }}/rootfs/${{ inputs.arch }}
         run: |
           # Build-rootfs is the source of truth for package selection. Compute
           # the scheduled-run cache key from the actual kernel it installed.
           fingerprint=$(./kmod-ci/scripts/rootfs-fingerprint.sh \
             "${{ matrix.distro }}" \
-            "${RUNNER_TEMP}/rootfs/${{ matrix.distro }}" \
+            "${ROOTFS_PARENT}/${{ matrix.distro }}" \
             "${GITHUB_SHA}")
           echo "hash=${fingerprint}" >> "${GITHUB_OUTPUT}"
 
@@ -146,9 +201,11 @@ jobs:
         with:
           # Scheduled runs only need to rerun the caller payload when this exact
           # repo revision has not already passed with the generated rootfs.
-          path: ${{ runner.temp }}/vng-cache/${{ matrix.distro }}
+          path: >-
+            ${{ runner.temp }}/vng-cache/${{ inputs.arch }}/${{ matrix.distro }}
           key: >-
-            ${{ inputs.cache-prefix }}-${{ matrix.distro }}-${{
+            ${{ inputs.cache-prefix }}-${{ inputs.arch }}-${{
+            matrix.distro }}-${{
             steps.rootfs-fingerprint.outputs.hash }}
           lookup-only: true
 
@@ -170,11 +227,16 @@ jobs:
 
       - name: Run payload in ${{ matrix.distro }}
         if: steps.result-cache.outputs.cache-hit != 'true'
+        env:
+          KMOD_CI_ARCH: ${{ inputs.arch }}
+          ROOTFS_PARENT: ${{ runner.temp }}/rootfs/${{ inputs.arch }}
         run: |
-          sudo env VNG="${RUNNER_TEMP}/virtme-ng/vng" \
+          sudo env \
+            KMOD_CI_ARCH="${KMOD_CI_ARCH}" \
+            VNG="${RUNNER_TEMP}/virtme-ng/vng" \
             ./kmod-ci/scripts/run-guest.sh \
             "${{ matrix.distro }}" \
-            "${RUNNER_TEMP}/rootfs/${{ matrix.distro }}" \
+            "${ROOTFS_PARENT}/${{ matrix.distro }}" \
             "${GITHUB_WORKSPACE}/repo" \
             "${{ inputs.guest-script }}"
 
@@ -184,7 +246,8 @@ jobs:
           steps.result-cache.outputs.cache-hit != 'true'
         run: |
           # Save a tiny marker only after the scheduled payload passes.
-          cache_dir="${RUNNER_TEMP}/vng-cache/${{ matrix.distro }}"
+          cache_dir="${RUNNER_TEMP}/vng-cache/${{ inputs.arch }}"
+          cache_dir="${cache_dir}/${{ matrix.distro }}"
           mkdir -p "${cache_dir}"
           printf '%s\n' \
             "${{ steps.rootfs-fingerprint.outputs.hash }}" \
@@ -196,7 +259,9 @@ jobs:
           steps.result-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
-          path: ${{ runner.temp }}/vng-cache/${{ matrix.distro }}
+          path: >-
+            ${{ runner.temp }}/vng-cache/${{ inputs.arch }}/${{ matrix.distro }}
           key: >-
-            ${{ inputs.cache-prefix }}-${{ matrix.distro }}-${{
+            ${{ inputs.cache-prefix }}-${{ inputs.arch }}-${{
+            matrix.distro }}-${{
             steps.rootfs-fingerprint.outputs.hash }}

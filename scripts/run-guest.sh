@@ -79,6 +79,12 @@ fi
 if [ "${VNG_VERBOSE:-1}" = "1" ]; then
 	vng_args+=(--verbose)
 fi
+if [ "${KMOD_CI_ARCH:-x86_64}" = "arm64" ]; then
+	# Some older arm64 guest kernels fail to negotiate POSIX ACLs on the
+	# root virtiofs export. This is only needed while testing the arm64 CI
+	# matrix with the temporary virtme-ng branch.
+	vng_args+=(--no-root-posix-acl)
+fi
 if [ "${force_9p}" -eq 1 ]; then
 	echo "Forcing 9p rootfs in vng"
 	vng_args+=(--force-9p)
