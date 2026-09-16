@@ -1,5 +1,9 @@
 # ovpn kernel module CI
 
+In-tree submissions are handled by the [Patchwork CI](docs/patchwork-ci.md): a
+[Cloudflare Worker](listener/README.md) dispatches completed ovpn submissions,
+and Actions runs NIPA checks and parallel per-patch kernel builds/selftests.
+
 Shared GitHub Actions CI for booting distro rootfs images with virtme-ng and
 running an out-of-tree OpenVPN kernel module payload inside the guest.
 

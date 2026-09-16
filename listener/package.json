@@ -1,0 +1,15 @@
+{
+  "name": "ovpn-patchwork-listener",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "preview": "node scripts/preview.js",
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy"
+  },
+  "engines": { "node": ">=22.13" },
+  "devDependencies": {
+    "wrangler": "4.132.0"
+  }
+}

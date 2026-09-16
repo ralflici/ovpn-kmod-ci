@@ -1,0 +1,52 @@
+---
+name: Validate Patchwork CI
+
+# Tests our CI implementation when it changes. Kernel submissions are tested
+# by patchwork.yml. This workflow neither dispatches submissions nor deploys.
+"on":
+  push:
+    paths:
+      - listener/**
+      - scripts/patchwork_ci.py
+      - scripts/run-kselftests*.sh
+      - tests/**
+      - .github/workflows/patchwork.yml
+      - .github/workflows/validate-patchwork.yml
+  pull_request:
+    paths:
+      - listener/**
+      - scripts/patchwork_ci.py
+      - scripts/run-kselftests*.sh
+      - tests/**
+      - .github/workflows/patchwork.yml
+      - .github/workflows/validate-patchwork.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Listener tests and Worker build
+        working-directory: listener
+        run: |
+          npm ci
+          npm test
+          npx wrangler deploy --dry-run
+      - name: Preparation and result tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Check shell scripts
+        run: shellcheck scripts/run-kselftests.sh scripts/run-kselftests-guest.sh
+      - name: Check workflow definitions
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          "$RUNNER_TEMP/bin/actionlint" .github/workflows/patchwork.yml .github/workflows/validate-patchwork.yml

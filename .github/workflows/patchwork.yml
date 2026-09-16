@@ -1,0 +1,148 @@
+---
+name: ovpn Patchwork CI
+run-name: >-
+  Patchwork ${{ inputs.kind || github.event.client_payload.kind }}
+  ${{ inputs.id || github.event.client_payload.id }}
+
+"on":
+  repository_dispatch:
+    types: [ovpn-patchwork]
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Patchwork object kind
+        type: choice
+        options: [series, patch]
+        required: true
+      id:
+        description: Patchwork series or standalone patch ID
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Jobs have separate filesystems. Share the emails and pinned base SHA in the
+  # submission artifact; each test job creates its own Linux checkout in source/.
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      nipa_revision: ${{ steps.prepare.outputs.nipa_revision }}
+    steps:
+      - name: Checkout CI scripts
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Fetch submission and select base
+        id: prepare
+        env:
+          KIND: ${{ inputs.kind || github.event.client_payload.kind }}
+          OBJECT_ID: ${{ inputs.id || github.event.client_payload.id }}
+          EVENT_ID: ${{ github.event.client_payload.patchwork_event_id }}
+        run: |
+          args=()
+          if [ -n "$EVENT_ID" ]; then
+            args+=(--event-id "$EVENT_ID")
+          fi
+          python3 scripts/patchwork_ci.py prepare \
+            --kind "$KIND" --id "$OBJECT_ID" --output submission "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: submission
+          path: submission/
+          if-no-files-found: error
+
+  nipa:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout CI scripts
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Checkout NIPA test suite into nipa/
+        uses: actions/checkout@v5
+        with:
+          repository: linux-netdev/nipa
+          ref: ${{ needs.prepare.outputs.nipa_revision }}
+          path: nipa
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: submission
+          path: submission
+      - name: Install check dependencies
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential codespell git libmnl-dev libnl-3-dev \
+            libnl-genl-3-dev patch perl pkg-config python3-jsonschema \
+            python3-pip python3-requests python3-venv python3-yaml shellcheck yamllint
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/pip install pylint ruff
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Checkout submission base
+        # --submission and --source take directory paths. For NIPA, leave the
+        # kernel at the base: ingest_mdir.py applies the series as it runs checks.
+        run: python3 scripts/patchwork_ci.py checkout --submission submission --source source
+      - name: Run NIPA series and per-patch checks
+        # --nipa points to the separate NIPA checkout above, not the Linux tree.
+        run: |
+          python3 scripts/patchwork_ci.py nipa --submission submission \
+            --source source --nipa nipa --results nipa-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nipa-results
+          path: nipa-results/
+          if-no-files-found: warn
+
+  build-selftests:
+    name: Build and selftests - patch ${{ matrix.index }} (PW ${{ matrix.id }})
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: submission
+          path: submission
+      - name: Install build and guest dependencies
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc bison build-essential busybox-static cpio dwarves flex git \
+            iperf3 iproute2 iputils-ping jq kmod libelf-dev libmbedtls-dev \
+            libnl-3-dev libnl-genl-3-dev libssl-dev nftables pkg-config \
+            procps python3-jsonschema python3-pip python3-venv python3-yaml \
+            qemu-system-x86 rsync tcpdump util-linux virtiofsd
+          python3 -m venv --system-site-packages .venv
+          # Match NIPA's docker/selftests/Dockerfile.
+          .venv/bin/pip install virtme-ng==1.41
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Apply patches through this matrix entry
+        # Entry N tests the cumulative tree: base + patches 1 through N.
+        env:
+          PATCH_INDEX: ${{ matrix.index }}
+        run: |
+          mkdir -p selftest-results
+          python3 scripts/patchwork_ci.py checkout --submission submission \
+            --source source --through "$PATCH_INDEX" 2>&1 | tee selftest-results/apply.log
+      - name: Build kernel and run ovpn selftests
+        run: bash scripts/run-kselftests.sh source selftest-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftests-patch-${{ matrix.index }}-${{ matrix.id }}
+          path: selftest-results/
+          if-no-files-found: warn
